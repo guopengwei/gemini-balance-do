@@ -21,6 +21,7 @@ const fixCors = ({ headers, status, statusText }: { headers?: HeadersInit; statu
 const BASE_URL = 'https://generativelanguage.googleapis.com';
 const API_VERSION = 'v1beta';
 const API_CLIENT = 'genai-js/0.21.0';
+const GEMINI_3_PREVIEW_MODELS = ['gemini-3-pro-preview', 'gemini-3-flash-preview', 'gemini-3-pro-image-preview'];
 
 const makeHeaders = (apiKey: string, more?: Record<string, string>) => ({
 	'x-goog-api-client': API_CLIENT,
@@ -311,15 +312,27 @@ export class LoadBalancer extends DurableObject {
 		let responseBody: BodyInit | null = response.body;
 		if (response.ok) {
 			const { models } = JSON.parse(await response.text());
-			responseBody = JSON.stringify(
-				{
-					object: 'list',
-					data: models.map(({ name }: any) => ({
-						id: name.replace('models/', ''),
+			const data = models.map(({ name }: any) => ({
+				id: name.replace('models/', ''),
+				object: 'model',
+				created: 0,
+				owned_by: '',
+			}));
+			const existing = new Set(data.map((item: any) => item.id));
+			for (const model of GEMINI_3_PREVIEW_MODELS) {
+				if (!existing.has(model)) {
+					data.push({
+						id: model,
 						object: 'model',
 						created: 0,
 						owned_by: '',
-					})),
+					});
+				}
+			}
+			responseBody = JSON.stringify(
+				{
+					object: 'list',
+					data,
 				},
 				null,
 				'  '
@@ -412,17 +425,23 @@ export class LoadBalancer extends DurableObject {
 			}
 		}
 
-		switch (true) {
-			case model.endsWith(':search'):
-				model = model.substring(0, model.length - 7);
-			case req.model.endsWith('-search-preview'):
-			case req.tools?.some((tool: any) => tool.function?.name === 'googleSearch'):
-				body.tools = body.tools || [];
-				body.tools.push({ function_declarations: [{ name: 'googleSearch', parameters: {} }] });
+		const needsGoogleSearch =
+			(typeof req.model === 'string' && req.model.endsWith('-search-preview')) ||
+			(typeof req.model === 'string' && req.model.endsWith(':search')) ||
+			model.endsWith(':search') ||
+			req.tools?.some((tool: any) => tool.function?.name === 'googleSearch') ||
+			this.hasGoogleSearchTool(body.tools);
+		if (model.endsWith(':search')) {
+			model = model.substring(0, model.length - 7);
+		}
+		if (needsGoogleSearch && !this.hasGoogleSearchTool(body.tools)) {
+			body.tools = body.tools || [];
+			body.tools.push({ function_declarations: [{ name: 'googleSearch', parameters: {} }] });
 		}
 
+		const apiVersion = this.selectApiVersion(req, body);
 		const TASK = req.stream ? 'streamGenerateContent' : 'generateContent';
-		let url = `${BASE_URL}/${API_VERSION}/models/${model}:${TASK}`;
+		let url = `${BASE_URL}/${apiVersion}/models/${model}:${TASK}`;
 		if (req.stream) {
 			url += '?alt=sse';
 		}
@@ -526,13 +545,11 @@ export class LoadBalancer extends DurableObject {
 			top_p: 'topP',
 		};
 
-		const thinkingBudgetMap: Record<string, number> = {
-			low: 1024,
-			medium: 8192,
-			high: 24576,
-		};
-
 		let cfg: any = {};
+		if (req.config && typeof req.config === 'object' && !Array.isArray(req.config)) {
+			cfg = { ...req.config };
+		}
+
 		for (let key in req) {
 			const matchedKey = fieldsMap[key];
 			if (matchedKey) {
@@ -558,11 +575,71 @@ export class LoadBalancer extends DurableObject {
 					throw new HttpError('Unsupported response_format.type', 400);
 			}
 		}
-		if (req.reasoning_effort) {
-			cfg.thinkingConfig = { thinkingBudget: thinkingBudgetMap[req.reasoning_effort] };
+		const thinkingConfig = this.normalizeThinkingConfig(req);
+		if (thinkingConfig) {
+			cfg.thinkingConfig = { ...(cfg.thinkingConfig || {}), ...thinkingConfig };
+		}
+
+		if (cfg.tools) {
+			delete cfg.tools;
 		}
 
 		return cfg;
+	}
+
+	private normalizeThinkingConfig(req: any) {
+		const thinkingBudgetMap: Record<string, number> = {
+			low: 1024,
+			medium: 8192,
+			high: 24576,
+		};
+		const thinkingLevels = new Set(['low', 'medium', 'high']);
+
+		const directConfig =
+			(typeof req.thinking_config === 'object' && !Array.isArray(req.thinking_config) && req.thinking_config) ||
+			(typeof req.thinkingConfig === 'object' && !Array.isArray(req.thinkingConfig) && req.thinkingConfig) ||
+			(typeof req.config?.thinkingConfig === 'object' && !Array.isArray(req.config.thinkingConfig) && req.config.thinkingConfig);
+
+		let cfg = directConfig ? { ...directConfig } : undefined;
+
+		const levelInput = req.thinking_level ?? req.reasoning_effort;
+		const level = typeof levelInput === 'string' ? levelInput.toLowerCase() : undefined;
+		if (level && thinkingLevels.has(level)) {
+			cfg = { ...(cfg || {}) };
+			cfg.thinkingLevel = cfg.thinkingLevel ?? level;
+			if (thinkingBudgetMap[level]) {
+				cfg.thinkingBudget = cfg.thinkingBudget ?? thinkingBudgetMap[level];
+			}
+		}
+
+		return cfg;
+	}
+
+	private selectApiVersion(req: any, body: any) {
+		const apiVersionOverride =
+			req.api_version || req.apiVersion || req.config?.apiVersion || req.extra_body?.google?.api_version || req.extra_body?.google?.apiVersion;
+
+		if (typeof apiVersionOverride === 'string') {
+			return apiVersionOverride;
+		}
+
+		if (this.hasMediaResolution(body)) {
+			return 'v1alpha';
+		}
+
+		return API_VERSION;
+	}
+
+	private hasMediaResolution(body: any) {
+		const checkParts = (parts?: any[]) => parts?.some((p) => p?.mediaResolution) ?? false;
+		return (
+			checkParts(body?.system_instruction?.parts) ||
+			(Array.isArray(body?.contents) && body.contents.some((msg: any) => checkParts(msg.parts)))
+		);
+	}
+
+	private hasGoogleSearchTool(tools?: any[]) {
+		return Array.isArray(tools) && tools.some((tool) => tool && typeof tool === 'object' && 'googleSearch' in tool);
 	}
 
 	private async transformMessages(messages: any[]) {
@@ -615,9 +692,19 @@ export class LoadBalancer extends DurableObject {
 				case 'text':
 					parts.push({ text: item.text });
 					break;
-				case 'image_url':
-					parts.push(await this.parseImg(item.image_url.url));
+				case 'image_url': {
+					const imgPart = await this.parseImg(item.image_url.url);
+					const mediaLevel =
+						item.image_url.media_resolution_level ||
+						item.image_url.mediaResolutionLevel ||
+						item.image_url.media_resolution?.level ||
+						item.image_url.mediaResolution?.level;
+					if (mediaLevel) {
+						(imgPart as any).mediaResolution = { level: mediaLevel };
+					}
+					parts.push(imgPart);
 					break;
+				}
 				case 'input_audio':
 					parts.push({
 						inlineData: {
@@ -685,12 +772,20 @@ export class LoadBalancer extends DurableObject {
 	}
 
 	private transformTools(req: any) {
-		let tools, tool_config;
+		let tools: any[] | undefined;
+		let tool_config;
+
+		const configTools = Array.isArray(req.config?.tools) ? req.config.tools.filter((tool: any) => tool && typeof tool === 'object') : [];
+		if (configTools.length > 0) {
+			tools = [...configTools];
+		}
+
 		if (req.tools) {
 			const funcs = req.tools.filter((tool: any) => tool.type === 'function' && tool.function?.name !== 'googleSearch');
 			if (funcs.length > 0) {
 				funcs.forEach(this.adjustSchema);
-				tools = [{ function_declarations: funcs.map((schema: any) => schema.function) }];
+				tools = tools || [];
+				tools.push({ function_declarations: funcs.map((schema: any) => schema.function) });
 			}
 		}
 		if (req.tool_choice) {

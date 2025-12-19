@@ -104,6 +104,126 @@ API 密钥: `<你的AUTH_KEY>`，如果设置了 `FORWARD_CLIENT_KEY_ENABLED` �
 
 普通 Gemini/OpenAI API 调用只需使用 `AUTH_KEY`，无需管理权限认证
 
+## Gemini 3 预览支持与用法
+
+项目已内置 Gemini 3 预览型号列表，OpenAI 兼容的 `/v1/models` 会返回：
+
+- `gemini-3-pro-preview`
+- `gemini-3-flash-preview`
+- `gemini-3-pro-image-preview`
+
+同时透传了新版的思考配置、工具配置、图像生成配置与媒体分辨率配置，方便客户端直接使用官方 SDK。
+
+### 使用 @google/genai（Node/Browser）
+
+```ts
+import { GoogleGenAI } from "@google/genai";
+
+const ai = new GoogleGenAI({
+  // 可选：指定 API 版本（默认 v1beta，媒体分辨率需 v1alpha）
+  apiVersion: "v1beta",
+  // 如果使用本项目的 AUTH_KEY 模式，请在请求里带上 Authorization: Bearer <AUTH_KEY>
+});
+
+async function run() {
+  const response = await ai.models.generateContent({
+    model: "gemini-3-pro-preview",
+    contents: "How does AI work?",
+    config: {
+      // 思考级别：low / medium / high（自动映射到 thinkingBudget）
+      thinkingConfig: { thinkingLevel: "low" },
+    },
+  });
+
+  console.log(response.text);
+}
+
+run();
+```
+
+### 思考级别（thinking level）
+
+- 支持字段：`thinkingConfig`, `thinking_config`, `thinkingLevel`, `thinking_level`，以及 OpenAI 风格的 `reasoning_effort`（low/medium/high）。
+- 服务端会合并到 `generationConfig.thinkingConfig` 并补全 `thinkingBudget` 兼容旧字段。
+
+### 媒体分辨率（需要 v1alpha）
+
+```ts
+const ai = new GoogleGenAI({ apiVersion: "v1alpha" });
+
+await ai.models.generateContent({
+  model: "gemini-3-pro-preview",
+  contents: [
+    {
+      parts: [
+        { text: "What is in this image?" },
+        {
+          inlineData: { mimeType: "image/jpeg", data: "<base64>" },
+          mediaResolution: { level: "media_resolution_high" }, // 关键字段
+        },
+      ],
+    },
+  ],
+});
+```
+
+如果检测到 `mediaResolution`，代理会自动切换到 `v1alpha`，也可以显式传 `apiVersion`。
+
+### 工具与响应模式（googleSearch / urlContext / JSON schema）
+
+```ts
+import { GoogleGenAI } from "@google/genai";
+import { z } from "zod";
+import { zodToJsonSchema } from "zod-to-json-schema";
+
+const ai = new GoogleGenAI({});
+
+const matchSchema = z.object({
+  winner: z.string(),
+  final_match_score: z.string(),
+  scorers: z.array(z.string()),
+});
+
+const response = await ai.models.generateContent({
+  model: "gemini-3-pro-preview",
+  contents: "Search for all details for the latest Euro.",
+  config: {
+    tools: [{ googleSearch: {} }, { urlContext: {} }],
+    responseMimeType: "application/json",
+    responseJsonSchema: zodToJsonSchema(matchSchema),
+  },
+});
+```
+
+- `config.tools` 会被透传；如果请求或模型包含 `-search-preview`/`:search`，会自动追加 `googleSearch`。
+- `responseMimeType`/`responseJsonSchema`、`responseSchema` 均可传递。
+
+### 图像生成（gemini-3-pro-image-preview）
+
+```ts
+import { GoogleGenAI } from "@google/genai";
+import * as fs from "node:fs";
+
+const ai = new GoogleGenAI({});
+
+const response = await ai.models.generateContent({
+  model: "gemini-3-pro-image-preview",
+  contents: "Generate a visualization of the current weather in Tokyo.",
+  config: {
+    tools: [{ googleSearch: {} }], // 可选
+    imageConfig: { aspectRatio: "16:9", imageSize: "4K" },
+  },
+});
+
+for (const part of response.candidates[0].content.parts) {
+  if (part.inlineData) {
+    fs.writeFileSync("weather_tokyo.png", Buffer.from(part.inlineData.data, "base64"));
+  }
+}
+```
+
+> 提示：如果启用了 `FORWARD_CLIENT_KEY_ENABLED=true`，上述示例中的 `GoogleGenAI` 需直接传入你的 Google API Key；否则使用本服务的 `AUTH_KEY` 走负载均衡。
+
 
 ## 感谢
 
